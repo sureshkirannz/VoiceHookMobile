@@ -15,4 +15,11 @@ export const insertTranscriptionSchema = createInsertSchema(transcriptions).pick
 });
 
 export type InsertTranscription = z.infer<typeof insertTranscriptionSchema>;
-export type Transcription = typeof transcriptions.$inferSelect;
+
+// Inferred type from Drizzle
+type BaseTranscription = typeof transcriptions.$inferSelect;
+
+// Properly typed Transcription with webhook status as literal union
+export type Transcription = Omit<BaseTranscription, 'webhookStatus'> & {
+  webhookStatus: "pending" | "sent" | "failed";
+};

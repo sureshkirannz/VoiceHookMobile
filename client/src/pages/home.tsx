@@ -10,6 +10,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { apiRequest } from "@/lib/queryClient";
 import type { Transcription } from "@shared/schema";
 import type { TranscriptionResponse } from "@/types/api";
+import { parseTranscriptionResponse } from "@/types/api";
 
 type RecordingStatus = "idle" | "recording" | "transcribing";
 
@@ -64,8 +65,12 @@ export default function Home() {
     const recognition = new SpeechRecognition();
     
     recognition.continuous = true;
-    recognition.interimResults = false;
+    recognition.interimResults = true; // Get results faster
     recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
+    
+    let lastFinalTranscript = '';
+    let silenceTimeout: NodeJS.Timeout | null = null;
     
     recognition.onstart = () => {
       setStatus("recording");
@@ -76,58 +81,78 @@ export default function Home() {
     };
     
     recognition.onresult = async (event: any) => {
-      const last = event.results.length - 1;
-      const text = event.results[last][0].transcript.trim();
+      let interimTranscript = '';
+      let finalTranscript = '';
       
-      if (text) {
-        setStatus("transcribing");
+      // Process all results
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
         
-        // Create temporary transcription with pending status
-        const tempId = crypto.randomUUID();
-        const tempTranscription: Transcription = {
-          id: tempId,
-          text,
-          timestamp: new Date(),
-          webhookStatus: "pending",
-        };
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript;
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+      
+      // Clear any existing timeout
+      if (silenceTimeout) {
+        clearTimeout(silenceTimeout);
+      }
+      
+      // If we have a final result and it's new, send it immediately
+      if (finalTranscript && finalTranscript !== lastFinalTranscript) {
+        lastFinalTranscript = finalTranscript;
+        const text = finalTranscript.trim();
         
-        setTranscriptions(prev => [...prev, tempTranscription]);
-        
-        // Send to backend which will relay to webhook
-        try {
-          const response = await apiRequest("POST", "/api/transcriptions", { text });
-          const apiData: TranscriptionResponse = await response.json();
+        if (text) {
+          setStatus("transcribing");
           
-          // Convert API response to Transcription with Date object
-          const savedTranscription: Transcription = {
-            ...apiData,
-            timestamp: new Date(apiData.timestamp),
+          // Create temporary transcription with pending status
+          const tempId = crypto.randomUUID();
+          const tempTranscription: Transcription = {
+            id: tempId,
+            text,
+            timestamp: new Date(),
+            webhookStatus: "pending",
           };
           
-          // Update with actual transcription from server
-          setTranscriptions(prev =>
-            prev.map(t => t.id === tempId ? savedTranscription : t)
-          );
+          setTranscriptions(prev => [...prev, tempTranscription]);
           
-          setWebhookConnected(true);
-        } catch (error) {
-          console.error("API error:", error);
+          // Send to backend which will relay to webhook
+          try {
+            const response = await apiRequest("POST", "/api/transcriptions", { text });
+            const apiData: TranscriptionResponse = await response.json();
+            
+            // Convert API response to Transcription with Date object
+            const savedTranscription = parseTranscriptionResponse(apiData);
+            
+            // Update with actual transcription from server
+            setTranscriptions(prev =>
+              prev.map(t => t.id === tempId ? savedTranscription : t)
+            );
+            
+            setWebhookConnected(true);
+          } catch (error) {
+            console.error("API error:", error);
+            
+            // Mark as failed
+            setTranscriptions(prev =>
+              prev.map(t => t.id === tempId ? { ...t, webhookStatus: "failed" as const } : t)
+            );
+            
+            setWebhookConnected(false);
+            
+            toast({
+              variant: "destructive",
+              title: "Webhook delivery failed",
+              description: "Check your connection and try again",
+            });
+          }
           
-          // Mark as failed
-          setTranscriptions(prev =>
-            prev.map(t => t.id === tempId ? { ...t, webhookStatus: "failed" as const } : t)
-          );
-          
-          setWebhookConnected(false);
-          
-          toast({
-            variant: "destructive",
-            title: "Webhook delivery failed",
-            description: "Check your connection and try again",
-          });
+          setStatus("recording");
+          lastFinalTranscript = ''; // Reset for next phrase
         }
-        
-        setStatus("recording");
       }
     };
     
@@ -135,24 +160,37 @@ export default function Home() {
       console.error("Speech recognition error:", event.error);
       
       if (event.error === 'no-speech') {
-        // Just continue listening
+        // Just continue listening - this is normal
         return;
       }
       
-      if (event.error === 'aborted' || event.error === 'network') {
+      if (event.error === 'aborted') {
+        // Normal stop, don't restart
+        return;
+      }
+      
+      if (event.error === 'network') {
         toast({
           variant: "destructive",
-          title: "Recording interrupted",
-          description: "Restarting automatically...",
+          title: "Network error",
+          description: "Restarting recognition...",
         });
-        setTimeout(() => recognition.start(), 1000);
+        setTimeout(() => {
+          if (recognitionRef.current) {
+            recognition.start();
+          }
+        }, 1000);
       }
     };
     
     recognition.onend = () => {
-      // Auto-restart for continuous listening
-      if (status !== "idle") {
-        recognition.start();
+      // Auto-restart for continuous listening if we're still supposed to be recording
+      if (recognitionRef.current && status !== "idle") {
+        try {
+          recognition.start();
+        } catch (e) {
+          console.log("Recognition restart attempted but not needed");
+        }
       }
     };
     
