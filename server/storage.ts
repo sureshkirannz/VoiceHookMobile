@@ -1,37 +1,46 @@
-import { type User, type InsertUser } from "@shared/schema";
+import { type Transcription, type InsertTranscription } from "@shared/schema";
 import { randomUUID } from "crypto";
 
-// modify the interface with any CRUD methods
-// you might need
-
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  createTranscription(transcription: InsertTranscription): Promise<Transcription>;
+  getTranscriptions(): Promise<Transcription[]>;
+  updateTranscriptionWebhookStatus(id: string, status: "pending" | "sent" | "failed"): Promise<void>;
 }
 
 export class MemStorage implements IStorage {
-  private users: Map<string, User>;
+  private transcriptions: Map<string, Transcription>;
 
   constructor() {
-    this.users = new Map();
+    this.transcriptions = new Map();
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+  async createTranscription(insertTranscription: InsertTranscription): Promise<Transcription> {
+    const id = randomUUID();
+    const transcription: Transcription = {
+      ...insertTranscription,
+      id,
+      timestamp: new Date(),
+      webhookStatus: "pending",
+    };
+    this.transcriptions.set(id, transcription);
+    return transcription;
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
+  async getTranscriptions(): Promise<Transcription[]> {
+    return Array.from(this.transcriptions.values()).sort(
+      (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
     );
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+  async updateTranscriptionWebhookStatus(
+    id: string,
+    status: "pending" | "sent" | "failed"
+  ): Promise<void> {
+    const transcription = this.transcriptions.get(id);
+    if (transcription) {
+      transcription.webhookStatus = status;
+      this.transcriptions.set(id, transcription);
+    }
   }
 }
 
