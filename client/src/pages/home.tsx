@@ -26,6 +26,10 @@ export default function Home() {
   const recognitionRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isActivelyRecordingRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     // Auto-scroll to latest transcription
@@ -49,16 +53,57 @@ export default function Home() {
 
   const handleRequestPermission = async () => {
     try {
-      // Request microphone permission
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(track => track.stop()); // Stop the stream, we just needed permission
+      micStreamRef.current = stream;
+      
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.8;
+      
+      source.connect(analyser);
+      analyserRef.current = analyser;
       
       setShowPermissionPrompt(false);
       setPermissionError("");
       initializeSpeechRecognition();
+      startVolumeDetection();
     } catch (error) {
       setPermissionError("Microphone access denied. Please allow microphone access in your browser settings.");
     }
+  };
+  
+  const startVolumeDetection = () => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    
+    const detectVolume = () => {
+      if (!analyserRef.current) return;
+      
+      if (!isActivelyRecordingRef.current) {
+        setAudioLevel(0);
+      } else {
+        analyser.getByteFrequencyData(dataArray);
+        
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        const normalizedLevel = Math.min(average / 128, 1);
+        
+        setAudioLevel(normalizedLevel);
+      }
+      
+      animationFrameRef.current = requestAnimationFrame(detectVolume);
+    };
+    
+    detectVolume();
   };
 
   const initializeSpeechRecognition = () => {
@@ -70,14 +115,14 @@ export default function Home() {
     recognition.lang = 'en-US';
     recognition.maxAlternatives = 1;
     
-    let accumulatedTranscript = '';
-    let silenceTimeout: NodeJS.Timeout | null = null;
-    const SILENCE_DELAY = 1500;
+    let lastProcessedIndex = -1;
     
     const sendTranscription = async (text: string) => {
       if (!text.trim()) return;
       
-      setStatus("transcribing");
+      if (isActivelyRecordingRef.current) {
+        setStatus("transcribing");
+      }
       
       const tempId = crypto.randomUUID();
       const tempTranscription: Transcription = {
@@ -115,7 +160,9 @@ export default function Home() {
         });
       }
       
-      setStatus("recording");
+      if (isActivelyRecordingRef.current) {
+        setStatus("recording");
+      }
     };
     
     recognition.onstart = () => {
@@ -123,38 +170,24 @@ export default function Home() {
       setStatus("recording");
       toast({
         title: "Recording started",
-        description: "Speak naturally, transcriptions will be sent after pauses",
+        description: "Speak naturally - transcriptions sent after each pause",
       });
     };
     
     recognition.onresult = (event: any) => {
-      let interimTranscript = '';
-      let finalTranscript = '';
-      
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
+      for (let i = 0; i < event.results.length; i++) {
+        if (i <= lastProcessedIndex) continue;
         
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript;
-        } else {
-          interimTranscript += transcript;
+        const result = event.results[i];
+        if (result.isFinal) {
+          const transcript = result[0].transcript;
+          const confidence = result[0].confidence ?? 1;
+          
+          if (confidence >= 0.3 && transcript.trim().length >= 1) {
+            lastProcessedIndex = i;
+            sendTranscription(transcript.trim());
+          }
         }
-      }
-      
-      if (finalTranscript) {
-        accumulatedTranscript += (accumulatedTranscript ? ' ' : '') + finalTranscript;
-      }
-      
-      if (silenceTimeout) {
-        clearTimeout(silenceTimeout);
-      }
-      
-      if (accumulatedTranscript.trim()) {
-        silenceTimeout = setTimeout(() => {
-          const textToSend = accumulatedTranscript;
-          accumulatedTranscript = '';
-          sendTranscription(textToSend);
-        }, SILENCE_DELAY);
       }
     };
     
@@ -186,13 +219,21 @@ export default function Home() {
     };
     
     recognition.onend = () => {
-      // Auto-restart for continuous listening if we're still supposed to be recording
-      if (isActivelyRecordingRef.current && recognitionRef.current) {
-        try {
-          recognition.start();
-        } catch (e) {
-          console.log("Recognition restart attempted but not needed");
-        }
+      if (!isActivelyRecordingRef.current) {
+        return;
+      }
+      
+      if (recognitionRef.current) {
+        lastProcessedIndex = -1;
+        setTimeout(() => {
+          if (recognitionRef.current && isActivelyRecordingRef.current) {
+            try {
+              recognition.start();
+            } catch (e) {
+              console.error("Failed to restart recognition:", e);
+            }
+          }
+        }, 100);
       }
     };
     
@@ -202,29 +243,37 @@ export default function Home() {
 
   const handleStopRecording = () => {
     isActivelyRecordingRef.current = false;
+    
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    
     if (recognitionRef.current) {
       recognitionRef.current.stop();
       recognitionRef.current = null;
     }
+    
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => track.stop());
+      micStreamRef.current = null;
+    }
+    
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    
+    analyserRef.current = null;
     setStatus("idle");
     setAudioLevel(0);
+    
     toast({
       title: "Recording stopped",
       description: "Click record to start again",
     });
   };
 
-  // Simulate audio levels for visualization
-  useEffect(() => {
-    if (status === "recording") {
-      const interval = setInterval(() => {
-        setAudioLevel(Math.random() * 0.7 + 0.3);
-      }, 150);
-      return () => clearInterval(interval);
-    } else {
-      setAudioLevel(0);
-    }
-  }, [status]);
 
   const isRecording = status !== "idle";
 
@@ -302,7 +351,7 @@ export default function Home() {
           
           <p className="text-sm text-muted-foreground text-center">
             {isRecording 
-              ? "Recording... Transcriptions sent automatically on pauses"
+              ? "Recording... Speak naturally (sent after each pause)"
               : "Tap to start continuous recording"
             }
           </p>
